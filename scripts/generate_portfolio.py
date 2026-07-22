@@ -8,7 +8,7 @@ option_types = ["Call", "Put", "Stock"]
 
 print("🎲 Generating 10,000 randomized hedge fund positions...")
 
-# 2. Generate randomizsd matrix data
+# 2. Generate randomized matrix data
 data = {
     "TICKER": np.random.choice(tickers, num_positions),
     "POSITION_SIZE": np.random.randint(100, 5000, num_positions) * np.random.choice([-1, 1], num_positions), # Negative means Short/Sold
@@ -24,6 +24,6 @@ portfolio_df = pd.DataFrame(data)
 portfolio_df.loc[portfolio_df["OPTION_TYPE"] == "Stock", ["STRIKE_PRICE", "EXPIRY_DAYS"]] = 0
 
 # 4. Save to Disk
-portfolio_df.to_csv("portfolio.csv", index=False)
+portfolio_df.to_csv("data/portfolio.csv", index=False)
 print("✅ Success! Created 'portfolio.csv' with 10,000 positions.")
 print(portfolio_df.head())
