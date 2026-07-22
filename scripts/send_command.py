@@ -7,14 +7,25 @@ def run_chat_client():
     chat_socket = context.socket(zmq.REQ)
     chat_socket.connect("tcp://127.0.0.1:5556")
 
-    print("💬 Shaurya's Command Terminal Connected to C++ Server over Port 5556.")
-    print("Available test commands: 'STATUS_CHECK', 'MANUAL_OVERRIDE', or any text logs.")
-    print("-" * 65)
+    print("+----------------------------------------------------------+")
+    print("|  TradeVerse -- Command Terminal                           |")
+    print("|  Connected to C++ Risk Engine on Port 5556               |")
+    print("+----------------------------------------------------------+")
+    print()
+    print("Available commands:")
+    print("  FETCH:<TICKER>       -- Get price & volume  (e.g. FETCH:AAPL)")
+    print("  BUY:<TICKER>:<QTY>   -- Buy shares          (e.g. BUY:AAPL:100)")
+    print("  SELL:<TICKER>:<QTY>  -- Sell shares          (e.g. SELL:TSLA:50)")
+    print("  GREEKS:<TICKER>      -- Get live Greeks      (e.g. GREEKS:TSLA)")
+    print("  PORTFOLIO            -- Portfolio-level Greeks + latency")
+    print("  STATUS_CHECK         -- Engine health check")
+    print("  MANUAL_OVERRIDE      -- Emergency protocol")
+    print("-" * 58)
 
     try:
         while True:
        
-            user_command = input("Enter command to send (or 'exit' to quit): ").strip()
+            user_command = input(">> ").strip()
             
             if not user_command:
                 continue
@@ -23,12 +34,12 @@ def run_chat_client():
                 print("Closing command terminal.")
                 break
 
-            # 1. Send the string command to C++
+            # Send the string command to C++
             chat_socket.send_string(user_command)
             
-            # 2. Receive the mandatory confirmation back from C++
+            # Receive the mandatory confirmation back from C++
             reply = chat_socket.recv_string()
-            print(f"📡 [C++ Server Response]: {reply}\n")
+            print(f"[Server]: {reply}\n")
             
     except KeyboardInterrupt:
         print("\nExiting command terminal.")
