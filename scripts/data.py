@@ -58,7 +58,7 @@ if all_data:
     latest_df = final_df.groupby("Ticker").tail(1).reset_index(drop=True)
     
     # Save to CSV
-    filename = "../data/market_data1.csv"
+    filename = "data/market_data1.csv"
     latest_df.to_csv(filename, index=False)
     
     total_rows = len(latest_df)

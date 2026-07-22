@@ -25,6 +25,8 @@
 #include <vector>
 #include <iomanip>
 #include <cmath>
+#include <atomic>
+#include <condition_variable>
 
 #include "greeks.hpp"
 #include "portfolio.hpp"
@@ -77,18 +79,130 @@ std::string trim(const std::string& str) {
     return str.substr(first, (last - first + 1));
 }
 
-// Persist RAM inventory changes back to market_data1.csv
-void sync_to_csv() {
-    std::ofstream file(CSV_FILE, std::ios::trunc);
-    if (!file.is_open()) return;
+// ============================================================================
+// ASYNC WRITE-AHEAD LOG (WAL) — Disk I/O decoupled from trade hot path
+// ============================================================================
+// Instead of rewriting the entire CSV on every trade (which blocks the trader),
+// we append trade events to a lock-free queue. A dedicated background thread
+// drains the queue every 50ms and batch-writes to:
+//   1. data/trade_log.wal   — Append-only sequential log (fast)
+//   2. data/market_data1.csv — Periodic full snapshot (for server restarts)
+// ============================================================================
 
-    file << "Date,Ticker,Price,Volume\n";
-    for (const auto& [ticker, info] : live_market_prices) {
-        file << info.timestamp << "," << ticker << ","
-             << std::fixed << std::setprecision(2)
-             << info.price << "," << info.volume << "\n";
+struct TradeEvent {
+    std::string action;     // "BUY" or "SELL"
+    std::string ticker;
+    int         qty;
+    double      price;
+    int         new_volume; // Volume AFTER the trade
+    std::chrono::system_clock::time_point timestamp;
+};
+
+// Thread-safe WAL queue
+std::vector<TradeEvent> wal_queue;
+std::mutex wal_lock;
+std::condition_variable wal_cv;
+bool wal_shutdown = false;
+
+// Trade counter for latency stats
+std::atomic<uint64_t> total_trades_processed{0};
+std::atomic<uint64_t> total_wal_writes{0};
+
+// Push a trade event onto the WAL queue (called from worker threads)
+// This is O(1) — no disk I/O, no file open/close
+void wal_enqueue(const std::string& action, const std::string& ticker,
+                 int qty, double price, int new_volume) {
+    {
+        std::lock_guard<std::mutex> lock(wal_lock);
+        wal_queue.push_back({
+            action, ticker, qty, price, new_volume,
+            std::chrono::system_clock::now()
+        });
     }
-    file.close();
+    wal_cv.notify_one();  // Wake up the writer thread
+    total_trades_processed.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Background WAL writer thread — drains the queue and persists to disk
+// Runs independently from the trade engine, never blocks traders
+void wal_writer_thread() {
+    const std::string WAL_FILE = "data/trade_log.wal";
+
+    // Open WAL file in append mode (sequential writes = fastest disk I/O)
+    std::ofstream wal_stream(WAL_FILE, std::ios::app);
+    if (!wal_stream.is_open()) {
+        std::cerr << "[WAL] CRITICAL: Could not open " << WAL_FILE << std::endl;
+        return;
+    }
+
+    std::cout << "[WAL] Async writer thread started. Flush interval: 50ms" << std::endl;
+
+    int snapshot_counter = 0;
+    std::vector<TradeEvent> local_batch;  // Process locally to minimize lock hold time
+
+    while (true) {
+        // Wait for events or 50ms timeout (whichever comes first)
+        {
+            std::unique_lock<std::mutex> lock(wal_lock);
+            wal_cv.wait_for(lock, std::chrono::milliseconds(50), [] {
+                return !wal_queue.empty() || wal_shutdown;
+            });
+
+            if (wal_shutdown && wal_queue.empty()) break;
+
+            // Swap the queue into a local buffer — releases the lock instantly
+            // Worker threads can keep pushing trades while we write to disk
+            local_batch.swap(wal_queue);
+        }
+
+        if (local_batch.empty()) continue;
+
+        // Batch-write all events to the WAL file (append-only, sequential)
+        for (const auto& evt : local_batch) {
+            auto time_t = std::chrono::system_clock::to_time_t(evt.timestamp);
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                evt.timestamp.time_since_epoch()).count() % 1000000;
+
+            wal_stream << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S")
+                       << "." << std::setfill('0') << std::setw(6) << us
+                       << " | " << evt.action
+                       << " " << evt.ticker
+                       << " x" << evt.qty
+                       << " @ $" << std::fixed << std::setprecision(2) << evt.price
+                       << " | Vol After: " << evt.new_volume
+                       << "\n";
+
+            total_wal_writes.fetch_add(1, std::memory_order_relaxed);
+        }
+        wal_stream.flush();  // Ensure data hits disk
+
+        // Periodic full CSV snapshot (every 20 batches ≈ every 1 second)
+        // This is the "checkpoint" — if the server crashes, we lose at most 1s of trades
+        snapshot_counter += local_batch.size();
+        if (snapshot_counter >= 20) {
+            snapshot_counter = 0;
+
+            // Take a consistent snapshot under the market lock
+            std::lock_guard<std::mutex> lock(market_lock);
+            std::ofstream csv(CSV_FILE, std::ios::trunc);
+            if (csv.is_open()) {
+                csv << "Date,Ticker,Price,Volume\n";
+                for (const auto& [ticker, info] : live_market_prices) {
+                    csv << info.timestamp << "," << ticker << ","
+                        << std::fixed << std::setprecision(2)
+                        << info.price << "," << info.volume << "\n";
+                }
+                csv.close();
+            }
+        }
+
+        local_batch.clear();
+    }
+
+    // Final flush on shutdown
+    wal_stream.close();
+    std::cout << "[WAL] Writer thread shut down. Total writes: "
+              << total_wal_writes.load() << std::endl;
 }
 
 // Format PortfolioGreeks as a readable string
@@ -136,7 +250,7 @@ std::string execute_trade(const std::string& action, const std::string& ticker, 
     if (action == "BUY") {
         if (stock.volume >= qty) {
             stock.volume -= qty;
-            sync_to_csv();
+            wal_enqueue(action, ticker, qty, stock.price, stock.volume);
 
             // Refresh Greeks after trade
             refresh_greeks_for_ticker(ticker, stock.price);
@@ -156,7 +270,7 @@ std::string execute_trade(const std::string& action, const std::string& ticker, 
         }
     } else if (action == "SELL") {
         stock.volume += qty;
-        sync_to_csv();
+        wal_enqueue(action, ticker, qty, stock.price, stock.volume);
 
         // Refresh Greeks after trade
         refresh_greeks_for_ticker(ticker, stock.price);
@@ -270,7 +384,9 @@ void chatbox_worker_routine(zmq::context_t* context) {
         else if (client_msg == "STATUS_CHECK") {
             std::lock_guard<std::mutex> lock(market_lock);
             std::ostringstream oss;
-            oss << "HEALTH: Engine online | Market tickers: " << live_market_prices.size();
+            oss << "HEALTH: Engine online | Tickers: " << live_market_prices.size()
+                << " | Trades processed: " << total_trades_processed.load()
+                << " | WAL writes: " << total_wal_writes.load();
             if (portfolio_loaded) {
                 oss << " | Portfolio: " << global_portfolio.size() << " positions"
                     << " | Last Greek calc: " << std::fixed << std::setprecision(1)
@@ -412,7 +528,11 @@ int main() {
         std::cout << "[WARN] Run: python scripts/generate_portfolio.py to create portfolio.csv" << std::endl;
     }
 
-    // ---- 3. Fire up the multithreaded control proxy ----
+    // ---- 3. Start the async WAL writer thread ----
+    std::thread wal_thread(wal_writer_thread);
+    wal_thread.detach();
+
+    // ---- 4. Fire up the multithreaded control proxy ----
     std::thread proxy_worker(run_chatbox_proxy_server);
     proxy_worker.detach();
 
